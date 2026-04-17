@@ -435,18 +435,22 @@ class CollapsedCompositeContext(CompositeContext):
         staging_root = self._runtime_env.staging_root_path
         delta_root = self._runtime_env.delta_root_path
         if staging_root and delta_root:
-            try:
-                committer = DeltaCommitter(delta_root, staging_root)
-                committer.commit_all_tables(
-                    cleanup_staging=False,
-                    step_number=self._step_number,
-                    operation_name=f"_composite_{self._composite.name}_pre_curator",
-                )
-            except Exception:
+            committer = DeltaCommitter(delta_root, staging_root)
+            op_name = f"_composite_{self._composite.name}_pre_curator"
+            if not committer.staging_manager.iter_execution_run_dirs(
+                step_number=self._step_number,
+                operation_name=op_name,
+            ):
                 logger.debug(
                     "Pre-curator commit had no pending data (expected for "
                     "composites with no prior creator output)"
                 )
+                return
+            committer.commit_all_tables(
+                cleanup_staging=False,
+                step_number=self._step_number,
+                operation_name=op_name,
+            )
 
     def get_output_map(self) -> dict[str, CompositeRef]:
         """Return the recorded output mappings."""

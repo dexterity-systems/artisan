@@ -188,6 +188,8 @@ def build_step_result(
     success_override = None
     if failure_policy == FailurePolicy.FAIL_FAST and failed_count > 0:
         success_override = False
+    if metadata and metadata.get("terminal_failure"):
+        success_override = False
 
     return builder.build(success_override=success_override, metadata=metadata)
 
@@ -273,7 +275,7 @@ def _commit_and_compact(
                 logger.error("Commit failed for step %d: %s", step_number, commit_error)
 
     with phase_timer("compact", timings):
-        if has_work and compact:
+        if has_work and compact and commit_error is None:
             _compact_step_tables(config.delta_root, config.staging_root)
 
     return commit_error
@@ -288,6 +290,7 @@ def _build_step_metadata(
     metadata: dict[str, Any] = {"timings": timings}
     if commit_error:
         metadata["commit_error"] = commit_error
+        metadata["terminal_failure"] = "commit"
     if dispatch_error:
         metadata["dispatch_error"] = dispatch_error
     return metadata

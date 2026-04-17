@@ -1246,14 +1246,14 @@ class TestCommitFailureHandling:
     @patch("artisan.storage.io.commit.DeltaCommitter.commit_all_tables")
     @patch("artisan.orchestration.engine.step_executor.check_cache_for_batch")
     @patch("artisan.orchestration.engine.step_executor.resolve_inputs")
-    def test_creator_commit_failure_returns_step_result_with_error(
+    def test_creator_commit_failure_marks_terminal_step_failure(
         self,
         mock_resolve,
         mock_cache,
         mock_commit,
         tmp_path,
     ):
-        """Creator step captures commit error in metadata, doesn't raise."""
+        """Creator step returns a failed StepResult with commit diagnostics."""
         from artisan.orchestration.engine.step_executor import _execute_creator_step
         from artisan.schemas.orchestration.pipeline_config import PipelineConfig
 
@@ -1285,7 +1285,9 @@ class TestCommitFailureHandling:
         )
 
         assert "commit_error" in result.metadata
+        assert result.metadata["terminal_failure"] == "commit"
         assert "Disk full" in result.metadata["commit_error"]
+        assert result.success is False
         # succeeded/failed counts come from dispatch, not commit
         assert result.succeeded_count == 1
 

@@ -123,6 +123,39 @@ class TestRunReturnsFailedStepResult:
         call_args = mock_tracker.record_step_failed.call_args
         assert "ValueError" in call_args[0][1]
 
+    @patch("artisan.orchestration.pipeline_manager.execute_step")
+    @patch("artisan.orchestration.pipeline_manager.StepTracker")
+    def test_commit_terminal_step_records_failed_not_completed(
+        self, mock_tracker_cls, mock_execute, tmp_path
+    ):
+        """Commit-terminal results are recorded as failed steps with counts."""
+        mock_tracker = MagicMock()
+        mock_tracker.check_cache.return_value = None
+        mock_tracker_cls.return_value = mock_tracker
+
+        mock_execute.return_value = StepResult(
+            step_name="mock_op",
+            step_number=0,
+            success=False,
+            total_count=3,
+            succeeded_count=2,
+            failed_count=1,
+            output_roles=frozenset(["output"]),
+            output_types={"output": "data"},
+            metadata={
+                "commit_error": "OSError: Disk full",
+                "terminal_failure": "commit",
+            },
+        )
+
+        pipeline = _make_pipeline(tmp_path)
+        result = pipeline.run(_MockOp, inputs={"data": ["a" * 32]})
+
+        assert result.success is False
+        mock_tracker.record_step_failed.assert_called_once()
+        mock_tracker.record_step_completed.assert_not_called()
+        assert mock_tracker.record_step_failed.call_args.kwargs["result"] == result
+
 
 class TestResilientFinalize:
     """Tests for F23: finalize() survives failed futures."""

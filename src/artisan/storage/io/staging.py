@@ -195,6 +195,52 @@ class StagingManager:
         except (FileNotFoundError, PermissionError, OSError):
             pass
 
+    def _scope_root(
+        self,
+        step_number: int | None = None,
+        operation_name: str | None = None,
+    ) -> Path | None:
+        """Resolve the staging subtree for a step-scoped query."""
+        self._invalidate_nfs_cache(self.staging_dir)
+        if not self.staging_dir.exists():
+            return None
+
+        if step_number is None:
+            return self.staging_dir
+
+        if operation_name is not None:
+            step_dir = self.staging_dir / step_dir_name(step_number, operation_name)
+        else:
+            step_dir = self.staging_dir / str(step_number)
+
+        self._invalidate_nfs_cache(step_dir)
+        if not step_dir.exists():
+            return None
+        return step_dir
+
+    def iter_execution_run_dirs(
+        self,
+        step_number: int | None = None,
+        operation_name: str | None = None,
+    ) -> list[Path]:
+        """Return staged leaf directories that contain Parquet files.
+
+        Supports both legacy flat batch directories and the current
+        sharded execution-run layout.
+        """
+        scope_root = self._scope_root(
+            step_number=step_number,
+            operation_name=operation_name,
+        )
+        if scope_root is None:
+            return []
+
+        run_dirs: set[Path] = set()
+        for dirpath, _dirnames, filenames in os.walk(scope_root):
+            if any(name.endswith(".parquet") for name in filenames):
+                run_dirs.add(Path(dirpath))
+        return sorted(run_dirs)
+
     def get_staged_files_for_table(
         self,
         table_name: str,
@@ -217,24 +263,29 @@ class StagingManager:
             Paths to matching Parquet files. Empty list when the
             staging directory does not exist.
         """
-        # Invalidate NFS directory cache so rglob() sees files from workers
-        self._invalidate_nfs_cache(self.staging_dir)
-
-        if not self.staging_dir.exists():
+        scope_root = self._scope_root(
+            step_number=step_number,
+            operation_name=operation_name,
+        )
+        if scope_root is None:
             return []
+        return list(scope_root.rglob(f"{table_name}.parquet"))
 
-        if step_number is not None:
-            if operation_name is not None:
-                step_dir = self.staging_dir / step_dir_name(step_number, operation_name)
-            else:
-                step_dir = self.staging_dir / str(step_number)
-            self._invalidate_nfs_cache(step_dir)
-            if not step_dir.exists():
-                return []
-            return list(step_dir.rglob(f"{table_name}.parquet"))
+    def read_staged_table(
+        self,
+        run_dir: Path | str,
+        table_name: str,
+    ) -> pl.DataFrame | None:
+        """Read one staged Parquet table from a specific run directory.
 
-        # Backward compatible: search all directories
-        return list(self.staging_dir.rglob(f"{table_name}.parquet"))
+        Raises:
+            Any exception from ``polars.read_parquet`` when the file is
+            present but unreadable.
+        """
+        parquet_path = Path(run_dir) / f"{table_name}.parquet"
+        if not parquet_path.exists():
+            return None
+        return pl.read_parquet(parquet_path)
 
     def read_all_staged_for_table(
         self,
@@ -287,6 +338,20 @@ class StagingManager:
         batch_dir = self.staging_dir / batch_id
         if batch_dir.exists():
             shutil.rmtree(batch_dir)
+
+    def cleanup_execution_run_dir(self, run_dir: Path | str) -> None:
+        """Remove one staged run directory and prune empty parents."""
+        run_dir_path = Path(run_dir)
+        if run_dir_path.exists():
+            shutil.rmtree(run_dir_path)
+
+        parent = run_dir_path.parent
+        while parent != self.staging_dir and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
 
     def cleanup_step(self, step_number: int, operation_name: str | None = None) -> None:
         """Remove all staging directories for a given step.

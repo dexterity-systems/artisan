@@ -148,11 +148,14 @@ class TestRecordOperations:
         assert row["duration_seconds"] == 1.5
 
     def test_record_failed(self, tmp_path):
-        """Failed row has correct status and error message."""
+        """Failed row can preserve counts and commit diagnostics."""
         tracker = StepTracker(tmp_path, "run_1")
         record = _make_start_record()
+        result = _make_step_result(succeeded_count=4, failed_count=1).model_copy(
+            update={"metadata": {"commit_error": "Disk full", "terminal_failure": "commit"}}
+        )
         tracker.record_step_start(record)
-        tracker.record_step_failed(record, "Something went wrong")
+        tracker.record_step_failed(record, "Something went wrong", result=result)
 
         import polars as pl
 
@@ -161,6 +164,9 @@ class TestRecordOperations:
         assert len(failed) == 1
         row = failed.row(0, named=True)
         assert row["error"] == "Something went wrong"
+        assert row["succeeded_count"] == 4
+        assert row["failed_count"] == 1
+        assert row["commit_error"] == "Disk full"
 
 
 class TestLoadCompletedSteps:

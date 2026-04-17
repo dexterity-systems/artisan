@@ -1598,7 +1598,21 @@ class PipelineManager:
                 # Empty inputs at dispatch time: the step is "skipped"
                 # and _stopped is set so all subsequent steps short-circuit
                 # via _check_early_exit.
-                if result.metadata.get("skipped"):
+                if result.metadata.get("terminal_failure") == "commit":
+                    error_msg = result.metadata.get("commit_error") or "Commit failed"
+                    self._step_tracker.record_step_failed(
+                        start_record,
+                        error_msg,
+                        result=result,
+                    )
+                    logger.error(
+                        "Step %d (%s) failed during commit after %.1fs: %s",
+                        step_number,
+                        step_name,
+                        elapsed,
+                        error_msg,
+                    )
+                elif result.metadata.get("skipped"):
                     self._step_tracker.record_step_skipped(start_record, result)
                     self._stopped = True
                     logger.info(
@@ -1913,32 +1927,45 @@ class PipelineManager:
                         "step_run_id": composite_step_run_id,
                     },
                 )
-                self._step_tracker.record_step_completed(
-                    StepStartRecord(
-                        step_run_id=composite_step_run_id,
-                        step_spec_id=step_spec_id,
-                        step_number=step_number,
-                        step_name=name,
-                        operation_class=f"{composite_class.__module__}.{composite_class.__qualname__}",
-                        params_json=json.dumps(full_params or {}),
-                        input_refs_json=_serialize_input_refs(inputs),
-                        compute_backend=resolved_backend.name,
-                        compute_options_json="{}",
-                        output_roles_json=json.dumps(
-                            sorted(composite_class.outputs.keys())
-                        ),
-                        output_types_json=json.dumps(output_types_map),
+                start_record = StepStartRecord(
+                    step_run_id=composite_step_run_id,
+                    step_spec_id=step_spec_id,
+                    step_number=step_number,
+                    step_name=name,
+                    operation_class=f"{composite_class.__module__}.{composite_class.__qualname__}",
+                    params_json=json.dumps(full_params or {}),
+                    input_refs_json=_serialize_input_refs(inputs),
+                    compute_backend=resolved_backend.name,
+                    compute_options_json="{}",
+                    output_roles_json=json.dumps(
+                        sorted(composite_class.outputs.keys())
                     ),
-                    result,
+                    output_types_json=json.dumps(output_types_map),
                 )
-                logger.info(
-                    "Step %d (%s) completed in %.1fs [%d/%d succeeded]",
-                    step_number,
-                    name,
-                    elapsed,
-                    result.succeeded_count,
-                    result.total_count,
-                )
+                if result.metadata.get("terminal_failure") == "commit":
+                    error_msg = result.metadata.get("commit_error") or "Commit failed"
+                    self._step_tracker.record_step_failed(
+                        start_record,
+                        error_msg,
+                        result=result,
+                    )
+                    logger.error(
+                        "Step %d (%s) failed during commit after %.1fs: %s",
+                        step_number,
+                        name,
+                        elapsed,
+                        error_msg,
+                    )
+                else:
+                    self._step_tracker.record_step_completed(start_record, result)
+                    logger.info(
+                        "Step %d (%s) completed in %.1fs [%d/%d succeeded]",
+                        step_number,
+                        name,
+                        elapsed,
+                        result.succeeded_count,
+                        result.total_count,
+                    )
                 self._step_results.append(result)
                 self._named_steps.setdefault(result.step_name, []).append(result)
                 return result
