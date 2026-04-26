@@ -33,6 +33,7 @@ from artisan.orchestration.engine.step_tracker import StepTracker
 from artisan.orchestration.step_future import StepFuture
 from artisan.schemas.artifact.types import ArtifactTypes
 from artisan.schemas.enums import CachePolicy, FailurePolicy
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.schemas.orchestration.output_reference import OutputReference
 from artisan.schemas.orchestration.pipeline_config import PipelineConfig
 from artisan.schemas.orchestration.step_result import StepResult
@@ -229,7 +230,11 @@ def _promote_file_paths_to_store(
     )
 
     # Commit directly to Delta Lake (pre-dispatch)
-    committer = DeltaCommitter(config.delta_root, config.staging_root)
+    committer = DeltaCommitter(
+        config.delta_root,
+        config.staging_root,
+        commit_config=config.commit_config,
+    )
     committer.commit_dataframe(file_ref_df, "artifacts/file_refs")
     committer.commit_dataframe(index_df, TablePath.ARTIFACT_INDEX)
 
@@ -516,7 +521,11 @@ class PipelineManager:
         if config.recover_staging:
             from artisan.storage.io.commit import DeltaCommitter
 
-            committer = DeltaCommitter(config.delta_root, config.staging_root)
+            committer = DeltaCommitter(
+                config.delta_root,
+                config.staging_root,
+                commit_config=config.commit_config,
+            )
             committer.recover_staged(preserve_staging=config.preserve_staging)
 
         self._start_time: float = time.time()
@@ -804,6 +813,7 @@ class PipelineManager:
         preserve_working: bool = False,
         recover_staging: bool = True,
         skip_cache: bool = False,
+        commit_config: CommitConfig | dict[str, Any] | None = None,
         prefect_server: str | None = None,
     ) -> PipelineManager:
         """Factory method to create a PipelineManager.
@@ -827,6 +837,7 @@ class PipelineManager:
             recover_staging: Commit leftover staging files from prior crashed
                 runs at pipeline init. Defaults to True.
             skip_cache: Bypass all cache lookups for every step.
+            commit_config: Optional staged Delta commit chunking configuration.
             prefect_server: Prefect server URL. If None, auto-discovered.
 
         Returns:
@@ -861,6 +872,7 @@ class PipelineManager:
             preserve_working=preserve_working,
             recover_staging=recover_staging,
             skip_cache=skip_cache,
+            **({"commit_config": commit_config} if commit_config is not None else {}),
         )
         instance = cls(config)
         logger.info("Pipeline '%s' initialized (run_id=%s)", name, pipeline_run_id)

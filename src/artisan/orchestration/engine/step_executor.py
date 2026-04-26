@@ -264,7 +264,11 @@ def _commit_and_compact(
             try:
                 from artisan.storage.io.commit import DeltaCommitter
 
-                committer = DeltaCommitter(config.delta_root, config.staging_root)
+                committer = DeltaCommitter(
+                    config.delta_root,
+                    config.staging_root,
+                    commit_config=config.commit_config,
+                )
                 committer.commit_all_tables(
                     cleanup_staging=not runtime_env.preserve_staging,
                     step_number=step_number,

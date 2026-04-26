@@ -37,6 +37,7 @@ from artisan.orchestration.pipeline_manager import (
     _validate_resources,
 )
 from artisan.schemas.artifact.types import ArtifactTypes
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.schemas.orchestration.output_reference import OutputReference
 from artisan.schemas.orchestration.pipeline_config import PipelineConfig
 from artisan.schemas.orchestration.step_result import StepResult
@@ -79,6 +80,20 @@ def _make_pipeline(tmp_path) -> PipelineManager:
         working_root=tmp_path / "working",
     )
     return PipelineManager(config)
+
+
+def test_pipeline_config_accepts_commit_config(tmp_path):
+    """PipelineConfig carries staged commit chunk settings."""
+    config = PipelineConfig(
+        name="test",
+        delta_root=tmp_path / "delta",
+        staging_root=tmp_path / "staging",
+        working_root=tmp_path / "working",
+        commit_config=CommitConfig(initial_chunk_size=7, max_commit_chunk_rows=99),
+    )
+
+    assert config.commit_config.initial_chunk_size == 7
+    assert config.commit_config.max_commit_chunk_rows == 99
 
 
 class TestRunReturnsFailedStepResult:

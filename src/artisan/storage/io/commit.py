@@ -9,12 +9,16 @@ compaction/vacuum.
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import polars as pl
 from deltalake import DeltaTable, WriterProperties
+
 from artisan.schemas.artifact.registry import ArtifactTypeDef
 from artisan.schemas.enums import TablePath
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.storage.core.table_schemas import (
     FRAMEWORK_SCHEMAS,
     NON_PARTITIONED_TABLES,
@@ -81,6 +85,101 @@ class CommitFailureError(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class ChunkEstimate:
+    """Conservative size estimate for a staged commit chunk."""
+
+    rows_by_table: dict[str, int] = field(default_factory=dict)
+    bytes_by_table: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def total_rows(self) -> int:
+        return sum(self.rows_by_table.values())
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(self.bytes_by_table.values())
+
+    def estimated_memory_bytes(self, multiplier: float) -> int:
+        return int(self.total_bytes * multiplier)
+
+
+class ChunkCommitFailureError(CommitFailureError):
+    """Raised when a staged execution-dir chunk cannot be fully committed."""
+
+    def __init__(
+        self,
+        *,
+        chunk_index: int,
+        run_dirs: list[Path],
+        table_name: str,
+        cause: Exception | str,
+        partial_results: dict[str, int] | None = None,
+        estimate: ChunkEstimate | None = None,
+    ) -> None:
+        self.chunk_index = chunk_index
+        self.run_dirs = run_dirs
+        self.execution_run_ids = [path.name for path in run_dirs]
+        self.estimate = estimate
+        first_dir = run_dirs[0] if run_dirs else Path("<none>")
+        first_id = self.execution_run_ids[0] if self.execution_run_ids else "<none>"
+        super().__init__(
+            execution_run_id=first_id,
+            run_dir=first_dir,
+            table_name=table_name,
+            cause=cause,
+            partial_results=partial_results,
+        )
+        detail = (
+            cause
+            if isinstance(cause, str)
+            else f"{type(cause).__name__}: {cause}"
+        )
+        ids = _format_execution_ids(self.execution_run_ids)
+        estimate_part = ""
+        if estimate is not None:
+            estimate_part = (
+                f", estimated_rows={estimate.total_rows}, "
+                f"estimated_bytes={estimate.total_bytes}"
+            )
+        RuntimeError.__init__(
+            self,
+            f"Chunk commit failed for chunk={chunk_index}, table={table_name}, "
+            f"execution_run_ids={ids}{estimate_part}: {detail}",
+        )
+
+
+def _format_execution_ids(execution_run_ids: list[str], sample_size: int = 3) -> str:
+    """Format execution-run IDs for concise progress/error logging."""
+    if not execution_run_ids:
+        return "[]"
+    if len(execution_run_ids) <= sample_size * 2:
+        return "[" + ", ".join(execution_run_ids) + "]"
+    head = ", ".join(execution_run_ids[:sample_size])
+    tail = ", ".join(execution_run_ids[-sample_size:])
+    return f"[{head}, ..., {tail}]"
+
+
+def _available_memory_bytes() -> int | None:
+    """Return available system memory without requiring psutil."""
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    meminfo = Path("/proc/meminfo")
+    try:
+        for line in meminfo.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
 class DeltaCommitter:
     """Commit staged Parquet files to Delta Lake tables.
 
@@ -89,16 +188,24 @@ class DeltaCommitter:
         staging_manager (StagingManager): Manages staged Parquet files.
     """
 
-    def __init__(self, delta_base_path: Path | str, staging_dir: Path | str):
+    def __init__(
+        self,
+        delta_base_path: Path | str,
+        staging_dir: Path | str,
+        *,
+        commit_config: CommitConfig | None = None,
+    ):
         """Initialize with Delta Lake root and staging directories.
 
         Args:
             delta_base_path: Root directory for Delta Lake tables.
             staging_dir: Root directory containing worker-staged
                 Parquet files.
+            commit_config: Optional tuning for staged commit chunking.
         """
         self.delta_base_path = Path(delta_base_path)
         self.staging_manager = StagingManager(staging_dir)
+        self.commit_config = commit_config or CommitConfig()
 
     def _table_path(self, table: str) -> Path:
         """Resolve the filesystem path for a Delta table."""
@@ -106,16 +213,11 @@ class DeltaCommitter:
 
     def _is_non_partitioned(self, table: str) -> bool:
         """Check if a table should not be partitioned."""
-        for npt in NON_PARTITIONED_TABLES:
-            if _to_str(npt) == _to_str(table):
-                return True
-        return False
+        return any(_to_str(npt) == _to_str(table) for npt in NON_PARTITIONED_TABLES)
 
     def _has_artifact_id(self, table: str) -> bool:
         """Check if the table supports artifact_id deduplication."""
-        if _to_str(table) == _to_str(TablePath.EXECUTION_EDGES):
-            return False
-        return True
+        return _to_str(table) != _to_str(TablePath.EXECUTION_EDGES)
 
     def _default_partition_by(self, table: str) -> list[str] | None:
         """Return the default partition columns for a table."""
@@ -233,6 +335,100 @@ class DeltaCommitter:
 
         return results
 
+    def commit_execution_run_dir_chunk(
+        self,
+        run_dirs: list[Path | str],
+        *,
+        cleanup_after: bool = True,
+        chunk_index: int = 1,
+        estimate: ChunkEstimate | None = None,
+    ) -> dict[str, int]:
+        """Commit a bounded chunk of staged execution directories.
+
+        All staged dirs in the chunk are preserved on any table failure.
+        Cleanup happens only after every table in the chunk has committed.
+        """
+        run_dir_paths = [Path(path) for path in run_dirs if Path(path).exists()]
+        if not run_dir_paths:
+            return {}
+
+        if estimate is None:
+            estimate = self._estimate_chunk(run_dir_paths)
+
+        self._validate_chunk_run_dirs(run_dir_paths, chunk_index, estimate)
+
+        results: dict[str, int] = {}
+        execution_ids = [path.name for path in run_dir_paths]
+        logger.info(
+            "Committing staged chunk %d: dirs=%d execution_run_ids=%s "
+            "estimated_rows=%d estimated_bytes=%d rows_by_table=%s",
+            chunk_index,
+            len(run_dir_paths),
+            _format_execution_ids(execution_ids),
+            estimate.total_rows,
+            estimate.total_bytes,
+            estimate.rows_by_table,
+        )
+
+        chunk_start = time.monotonic()
+        for table in _get_commit_order():
+            table_name = _table_name_from_path(_to_str(table))
+            try:
+                staged_df = self._read_staged_table_for_run_dirs(
+                    run_dir_paths,
+                    table_name,
+                )
+                if staged_df is None or staged_df.is_empty():
+                    continue
+                table_start = time.monotonic()
+                rows_committed = self.commit_dataframe(staged_df, table)
+                table_elapsed = time.monotonic() - table_start
+            except ChunkCommitFailureError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Staged chunk %d failed at table %s for execution_run_ids=%s",
+                    chunk_index,
+                    table_name,
+                    _format_execution_ids(execution_ids),
+                )
+                raise ChunkCommitFailureError(
+                    chunk_index=chunk_index,
+                    run_dirs=run_dir_paths,
+                    table_name=table_name,
+                    cause=exc,
+                    partial_results=results,
+                    estimate=estimate,
+                ) from exc
+
+            if rows_committed > 0:
+                results[table_name] = rows_committed
+            logger.info(
+                "Committed staged chunk %d table=%s staged_rows=%d "
+                "committed_rows=%d elapsed=%.2fs",
+                chunk_index,
+                table_name,
+                staged_df.shape[0],
+                rows_committed,
+                table_elapsed,
+            )
+
+        if cleanup_after:
+            for run_dir in run_dir_paths:
+                self.staging_manager.cleanup_execution_run_dir(run_dir)
+
+        elapsed = time.monotonic() - chunk_start
+        throughput = len(run_dir_paths) / elapsed * 60 if elapsed > 0 else 0.0
+        logger.info(
+            "Finished staged chunk %d: dirs=%d elapsed=%.2fs throughput=%.1f dirs/min",
+            chunk_index,
+            len(run_dir_paths),
+            elapsed,
+            throughput,
+        )
+
+        return results
+
     def commit_all_tables(
         self,
         cleanup_staging: bool = True,
@@ -271,18 +467,70 @@ class DeltaCommitter:
         if not run_dirs:
             return results
 
-        for run_dir in run_dirs:
-            run_results = self.commit_execution_run_dir(
-                run_dir,
+        if not self.commit_config.enabled:
+            for run_dir in run_dirs:
+                run_results = self.commit_execution_run_dir(
+                    run_dir,
+                    cleanup_after=cleanup_staging,
+                )
+                for table_name, rows_committed in run_results.items():
+                    results[table_name] = results.get(table_name, 0) + rows_committed
+
+            if results:
+                parts = [f"{name}={count}" for name, count in results.items()]
+                if parts:
+                    logger.debug(
+                        "Step %d commit: %s",
+                        step_number or 0,
+                        ", ".join(parts),
+                    )
+
+            return results
+
+        start = time.monotonic()
+        remaining = list(run_dirs)
+        chunk_index = 0
+        logger.info(
+            "Chunked staged commit starting: dirs=%d initial_chunk_size=%d "
+            "min_chunk_size=%d cleanup=%s",
+            len(remaining),
+            self.commit_config.initial_chunk_size,
+            self.commit_config.min_chunk_size,
+            cleanup_staging,
+        )
+
+        while remaining:
+            chunk_index += 1
+            chunk_run_dirs, estimate = self._select_commit_chunk(
+                remaining,
+                chunk_index,
+            )
+            run_results = self.commit_execution_run_dir_chunk(
+                chunk_run_dirs,
                 cleanup_after=cleanup_staging,
+                chunk_index=chunk_index,
+                estimate=estimate,
             )
             for table_name, rows_committed in run_results.items():
                 results[table_name] = results.get(table_name, 0) + rows_committed
+            remaining = remaining[len(chunk_run_dirs) :]
 
         if results:
             parts = [f"{name}={count}" for name, count in results.items()]
             if parts:
                 logger.debug("Step %d commit: %s", step_number or 0, ", ".join(parts))
+
+        elapsed = time.monotonic() - start
+        throughput = len(run_dirs) / elapsed * 60 if elapsed > 0 else 0.0
+        logger.info(
+            "Chunked staged commit finished: dirs=%d chunks=%d elapsed=%.2fs "
+            "throughput=%.1f dirs/min rows=%s",
+            len(run_dirs),
+            chunk_index,
+            elapsed,
+            throughput,
+            results,
+        )
 
         return results
 
@@ -347,9 +595,9 @@ class DeltaCommitter:
             table_name = _table_name_from_path(_to_str(table))
             parquet_path = batch_dir / f"{table_name}.parquet"
             if parquet_path.exists():
-                df = pl.read_parquet(parquet_path)
-                if not df.is_empty():
-                    rows = self.commit_dataframe(df, table)
+                staged_df = pl.read_parquet(parquet_path)
+                if not staged_df.is_empty():
+                    rows = self.commit_dataframe(staged_df, table)
                     if rows > 0:
                         results[table_name] = rows
 
@@ -361,6 +609,166 @@ class DeltaCommitter:
     # -------------------------------------------------------------------------
     # Helper methods
     # -------------------------------------------------------------------------
+
+    def _validate_chunk_run_dirs(
+        self,
+        run_dirs: list[Path],
+        chunk_index: int,
+        estimate: ChunkEstimate,
+    ) -> None:
+        """Ensure every candidate run dir has the required execution record."""
+        for run_dir in run_dirs:
+            if not (run_dir / "executions.parquet").exists():
+                raise ChunkCommitFailureError(
+                    chunk_index=chunk_index,
+                    run_dirs=run_dirs,
+                    table_name="executions",
+                    cause=f"missing required executions.parquet in {run_dir}",
+                    estimate=estimate,
+                )
+
+    def _read_staged_table_for_run_dirs(
+        self,
+        run_dirs: list[Path],
+        table_name: str,
+    ) -> pl.DataFrame | None:
+        """Read one table for a selected chunk, raising on unreadable files."""
+        dfs: list[pl.DataFrame] = []
+        for run_dir in run_dirs:
+            staged_df = self.staging_manager.read_staged_table(run_dir, table_name)
+            if staged_df is not None and not staged_df.is_empty():
+                dfs.append(staged_df)
+        if not dfs:
+            return None
+        return pl.concat(dfs, rechunk=True)
+
+    def _select_commit_chunk(
+        self,
+        remaining_run_dirs: list[Path],
+        chunk_index: int,
+    ) -> tuple[list[Path], ChunkEstimate]:
+        """Choose the largest safe prefix of remaining staged run dirs."""
+        config = self.commit_config
+        chunk_size = min(config.initial_chunk_size, len(remaining_run_dirs))
+        effective_min = min(config.min_chunk_size, len(remaining_run_dirs))
+        last_estimate: ChunkEstimate | None = None
+        last_violations: list[str] = []
+
+        while chunk_size >= effective_min:
+            candidate = remaining_run_dirs[:chunk_size]
+            estimate = self._estimate_chunk(candidate)
+            violations = self._chunk_limit_violations(estimate)
+            if not violations:
+                if chunk_size < min(config.initial_chunk_size, len(remaining_run_dirs)):
+                    logger.info(
+                        "Staged chunk %d shrunk to %d dirs: estimated_rows=%d "
+                        "estimated_bytes=%d",
+                        chunk_index,
+                        chunk_size,
+                        estimate.total_rows,
+                        estimate.total_bytes,
+                    )
+                return candidate, estimate
+
+            last_estimate = estimate
+            last_violations = violations
+            next_size = max(effective_min, chunk_size // 2)
+            if next_size == chunk_size:
+                break
+            logger.info(
+                "Staged chunk %d candidate too large; shrinking %d -> %d dirs: %s",
+                chunk_index,
+                chunk_size,
+                next_size,
+                "; ".join(violations),
+            )
+            chunk_size = next_size
+
+        estimate = last_estimate or self._estimate_chunk(
+            remaining_run_dirs[:effective_min]
+        )
+        violations = last_violations or self._chunk_limit_violations(estimate)
+        msg = (
+            f"minimum chunk size {effective_min} exceeds commit limits: "
+            f"{'; '.join(violations) if violations else 'unknown limit'}"
+        )
+        raise ChunkCommitFailureError(
+            chunk_index=chunk_index,
+            run_dirs=remaining_run_dirs[:effective_min],
+            table_name="probe",
+            cause=msg,
+            estimate=estimate,
+        )
+
+    def _estimate_chunk(self, run_dirs: list[Path]) -> ChunkEstimate:
+        """Estimate staged rows and bytes for a chunk before any Delta write."""
+        rows_by_table: dict[str, int] = {}
+        bytes_by_table: dict[str, int] = {}
+
+        for table in _get_commit_order():
+            table_name = _table_name_from_path(_to_str(table))
+            row_count = 0
+            byte_count = 0
+            for run_dir in run_dirs:
+                parquet_path = run_dir / f"{table_name}.parquet"
+                if not parquet_path.exists():
+                    continue
+                byte_count += parquet_path.stat().st_size
+                row_count += self._parquet_row_count(parquet_path)
+            if row_count or byte_count:
+                rows_by_table[table_name] = row_count
+                bytes_by_table[table_name] = byte_count
+
+        return ChunkEstimate(rows_by_table=rows_by_table, bytes_by_table=bytes_by_table)
+
+    @staticmethod
+    def _parquet_row_count(parquet_path: Path) -> int:
+        """Count rows through lazy Parquet metadata before loading file data."""
+        return int(
+            pl.scan_parquet(str(parquet_path))
+            .select(pl.len().alias("rows"))
+            .collect()
+            .item()
+        )
+
+    def _chunk_limit_violations(self, estimate: ChunkEstimate) -> list[str]:
+        """Return reasons a chunk estimate exceeds configured limits."""
+        config = self.commit_config
+        violations: list[str] = []
+
+        if (
+            config.max_commit_chunk_rows is not None
+            and estimate.total_rows > config.max_commit_chunk_rows
+        ):
+            violations.append(
+                f"rows {estimate.total_rows} > {config.max_commit_chunk_rows}"
+            )
+
+        if (
+            config.max_commit_chunk_bytes is not None
+            and estimate.total_bytes > config.max_commit_chunk_bytes
+        ):
+            violations.append(
+                f"bytes {estimate.total_bytes} > {config.max_commit_chunk_bytes}"
+            )
+
+        if config.max_commit_memory_fraction is not None:
+            available = _available_memory_bytes()
+            if available is not None:
+                budget = int(available * config.max_commit_memory_fraction)
+                estimated = estimate.estimated_memory_bytes(
+                    config.parquet_memory_multiplier
+                )
+                if estimated > budget:
+                    violations.append(
+                        f"estimated_memory {estimated} > budget {budget}"
+                    )
+            else:
+                logger.debug(
+                    "Skipping commit memory-fraction limit; available memory unknown"
+                )
+
+        return violations
 
     def _deduplicate_rows(
         self,
@@ -416,17 +824,18 @@ class DeltaCommitter:
             or all rows were deduplicated.
         """
         table_path = self._table_path(_to_str(table))
-        dedupe_key = self._dedupe_key_column(table, df)
+        staged_df = df
+        dedupe_key = self._dedupe_key_column(table, staged_df)
         if deduplicate and dedupe_key is not None:
-            df = self._deduplicate_rows(df, table_path, dedupe_key)
-            if df.is_empty():
+            staged_df = self._deduplicate_rows(staged_df, table_path, dedupe_key)
+            if staged_df.is_empty():
                 return 0
 
         if partition_by is None:
             partition_by = self._default_partition_by(table)
 
         if table_path.exists():
-            df.write_delta(
+            staged_df.write_delta(
                 str(table_path),
                 mode="append",
                 delta_write_options={
@@ -438,13 +847,13 @@ class DeltaCommitter:
             write_opts = {"writer_properties": DEFAULT_WRITER_PROPERTIES}
             if partition_by:
                 write_opts["partition_by"] = partition_by
-            df.write_delta(
+            staged_df.write_delta(
                 str(table_path),
                 mode="overwrite",
                 delta_write_options=write_opts,
             )
 
-        return df.shape[0]
+        return staged_df.shape[0]
 
     # -------------------------------------------------------------------------
     # Table management

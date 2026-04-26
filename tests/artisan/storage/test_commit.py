@@ -7,13 +7,18 @@ import pytest
 
 from artisan.schemas.artifact.metric import MetricArtifact
 from artisan.schemas.enums import TablePath
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.storage.core.table_schemas import (
     ARTIFACT_EDGES_SCHEMA,
     ARTIFACT_INDEX_SCHEMA,
     EXECUTION_EDGES_SCHEMA,
     EXECUTIONS_SCHEMA,
 )
-from artisan.storage.io.commit import CommitFailureError, DeltaCommitter
+from artisan.storage.io.commit import (
+    ChunkCommitFailureError,
+    CommitFailureError,
+    DeltaCommitter,
+)
 from artisan.storage.io.staging import StagingArea
 
 METRICS_SCHEMA = MetricArtifact.POLARS_SCHEMA
@@ -272,6 +277,93 @@ class TestDeltaCommitter:
         # Staging should be empty
         assert committer.staging_manager.list_batch_ids() == []
 
+    def test_commit_all_tables_uses_multiple_chunks(self, setup_paths):
+        """Chunked commit groups execution dirs into configured chunks."""
+        delta_path, staging_path = setup_paths
+        for i in range(5):
+            _stage_execution_batch(
+                staging_path,
+                batch_id=f"batch_{i}",
+                execution_run_id=f"exec_{i:03d}",
+                artifact_id=f"{i:032x}",
+            )
+
+        committer = DeltaCommitter(
+            delta_path,
+            staging_path,
+            commit_config=CommitConfig(initial_chunk_size=2),
+        )
+        chunk_sizes = []
+        original_commit_chunk = committer.commit_execution_run_dir_chunk
+
+        def wrapped_commit_chunk(run_dirs, *args, **kwargs):
+            chunk_sizes.append(len(run_dirs))
+            return original_commit_chunk(run_dirs, *args, **kwargs)
+
+        committer.commit_execution_run_dir_chunk = wrapped_commit_chunk
+
+        results = committer.commit_all_tables(cleanup_staging=True)
+
+        assert results["executions"] == 5
+        assert results["metrics"] == 5
+        assert chunk_sizes == [2, 2, 1]
+        assert list(staging_path.rglob("*.parquet")) == []
+
+    def test_commit_all_tables_probe_shrinks_chunk(self, setup_paths):
+        """Chunk probe shrinks before any Delta writes when row budget is small."""
+        delta_path, staging_path = setup_paths
+        for i in range(4):
+            _stage_execution_batch(
+                staging_path,
+                batch_id=f"batch_{i}",
+                execution_run_id=f"exec_{i:03d}",
+                artifact_id=f"{i:032x}",
+            )
+
+        committer = DeltaCommitter(
+            delta_path,
+            staging_path,
+            commit_config=CommitConfig(
+                initial_chunk_size=4,
+                min_chunk_size=1,
+                max_commit_chunk_rows=8,
+            ),
+        )
+        chunk_sizes = []
+        original_commit_chunk = committer.commit_execution_run_dir_chunk
+
+        def wrapped_commit_chunk(run_dirs, *args, **kwargs):
+            chunk_sizes.append(len(run_dirs))
+            return original_commit_chunk(run_dirs, *args, **kwargs)
+
+        committer.commit_execution_run_dir_chunk = wrapped_commit_chunk
+
+        results = committer.commit_all_tables(cleanup_staging=True)
+
+        assert results["executions"] == 4
+        assert chunk_sizes == [2, 2]
+        assert list(staging_path.rglob("*.parquet")) == []
+
+    def test_commit_all_tables_fails_when_min_chunk_exceeds_limit(self, setup_paths):
+        """Probe fails before writing when even one execution dir is too large."""
+        delta_path, staging_path = setup_paths
+        _stage_execution_batch(staging_path, batch_id="too_large")
+        committer = DeltaCommitter(
+            delta_path,
+            staging_path,
+            commit_config=CommitConfig(
+                initial_chunk_size=1,
+                min_chunk_size=1,
+                max_commit_chunk_rows=3,
+            ),
+        )
+
+        with pytest.raises(ChunkCommitFailureError, match="minimum chunk size"):
+            committer.commit_all_tables(cleanup_staging=True)
+
+        assert list(staging_path.rglob("*.parquet"))
+        assert not (delta_path / "artifacts/metrics").exists()
+
     def test_commit_all_tables_preserves_failed_staging(self, setup_paths, committer):
         """Failed incremental commit leaves staging in place for retry."""
         delta_path, staging_path = setup_paths
@@ -311,6 +403,45 @@ class TestDeltaCommitter:
         assert (
             pl.read_delta(str(delta_path / "orchestration/executions")).shape[0] == 1
         )
+
+    def test_commit_all_tables_preserves_entire_failed_chunk(self, setup_paths):
+        """A failure after earlier table writes leaves every chunk dir staged."""
+        delta_path, staging_path = setup_paths
+        for i in range(2):
+            _stage_execution_batch(
+                staging_path,
+                batch_id=f"batch_{i}",
+                execution_run_id=f"exec_{i:03d}",
+                artifact_id=f"{i:032x}",
+            )
+
+        committer = DeltaCommitter(
+            delta_path,
+            staging_path,
+            commit_config=CommitConfig(initial_chunk_size=2),
+        )
+        original_commit_dataframe = committer.commit_dataframe
+
+        def flaky_commit_dataframe(df, table, *args, **kwargs):
+            if table == TablePath.EXECUTIONS.value:
+                msg = "Disk full"
+                raise OSError(msg)
+            return original_commit_dataframe(df, table, *args, **kwargs)
+
+        committer.commit_dataframe = flaky_commit_dataframe
+
+        with pytest.raises(CommitFailureError, match="Disk full"):
+            committer.commit_all_tables(cleanup_staging=True)
+
+        assert (staging_path / "batch_0" / "executions.parquet").exists()
+        assert (staging_path / "batch_1" / "executions.parquet").exists()
+
+        committer.commit_dataframe = original_commit_dataframe
+        retry_results = committer.commit_all_tables(cleanup_staging=True)
+
+        assert retry_results.get("executions") == 2
+        assert retry_results.get("metrics", 0) == 0
+        assert list(staging_path.rglob("*.parquet")) == []
 
     def test_commit_all_tables_requires_execution_record(
         self, setup_paths, committer
