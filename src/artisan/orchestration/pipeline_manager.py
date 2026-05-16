@@ -33,6 +33,7 @@ from artisan.orchestration.engine.step_tracker import StepTracker
 from artisan.orchestration.step_future import StepFuture
 from artisan.schemas.artifact.types import ArtifactTypes
 from artisan.schemas.enums import CachePolicy, FailurePolicy
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.schemas.orchestration.output_reference import OutputReference
 from artisan.schemas.orchestration.pipeline_config import PipelineConfig
 from artisan.schemas.orchestration.step_result import StepResult
@@ -229,7 +230,11 @@ def _promote_file_paths_to_store(
     )
 
     # Commit directly to Delta Lake (pre-dispatch)
-    committer = DeltaCommitter(config.delta_root, config.staging_root)
+    committer = DeltaCommitter(
+        config.delta_root,
+        config.staging_root,
+        commit_config=config.commit_config,
+    )
     committer.commit_dataframe(file_ref_df, "artifacts/file_refs")
     committer.commit_dataframe(index_df, TablePath.ARTIFACT_INDEX)
 
@@ -516,7 +521,11 @@ class PipelineManager:
         if config.recover_staging:
             from artisan.storage.io.commit import DeltaCommitter
 
-            committer = DeltaCommitter(config.delta_root, config.staging_root)
+            committer = DeltaCommitter(
+                config.delta_root,
+                config.staging_root,
+                commit_config=config.commit_config,
+            )
             committer.recover_staged(preserve_staging=config.preserve_staging)
 
         self._start_time: float = time.time()
@@ -804,6 +813,7 @@ class PipelineManager:
         preserve_working: bool = False,
         recover_staging: bool = True,
         skip_cache: bool = False,
+        commit_config: CommitConfig | dict[str, Any] | None = None,
         prefect_server: str | None = None,
     ) -> PipelineManager:
         """Factory method to create a PipelineManager.
@@ -827,6 +837,7 @@ class PipelineManager:
             recover_staging: Commit leftover staging files from prior crashed
                 runs at pipeline init. Defaults to True.
             skip_cache: Bypass all cache lookups for every step.
+            commit_config: Optional staged Delta commit chunking configuration.
             prefect_server: Prefect server URL. If None, auto-discovered.
 
         Returns:
@@ -861,6 +872,7 @@ class PipelineManager:
             preserve_working=preserve_working,
             recover_staging=recover_staging,
             skip_cache=skip_cache,
+            **({"commit_config": commit_config} if commit_config is not None else {}),
         )
         instance = cls(config)
         logger.info("Pipeline '%s' initialized (run_id=%s)", name, pipeline_run_id)
@@ -1598,7 +1610,21 @@ class PipelineManager:
                 # Empty inputs at dispatch time: the step is "skipped"
                 # and _stopped is set so all subsequent steps short-circuit
                 # via _check_early_exit.
-                if result.metadata.get("skipped"):
+                if result.metadata.get("terminal_failure") == "commit":
+                    error_msg = result.metadata.get("commit_error") or "Commit failed"
+                    self._step_tracker.record_step_failed(
+                        start_record,
+                        error_msg,
+                        result=result,
+                    )
+                    logger.error(
+                        "Step %d (%s) failed during commit after %.1fs: %s",
+                        step_number,
+                        step_name,
+                        elapsed,
+                        error_msg,
+                    )
+                elif result.metadata.get("skipped"):
                     self._step_tracker.record_step_skipped(start_record, result)
                     self._stopped = True
                     logger.info(
@@ -1913,32 +1939,45 @@ class PipelineManager:
                         "step_run_id": composite_step_run_id,
                     },
                 )
-                self._step_tracker.record_step_completed(
-                    StepStartRecord(
-                        step_run_id=composite_step_run_id,
-                        step_spec_id=step_spec_id,
-                        step_number=step_number,
-                        step_name=name,
-                        operation_class=f"{composite_class.__module__}.{composite_class.__qualname__}",
-                        params_json=json.dumps(full_params or {}),
-                        input_refs_json=_serialize_input_refs(inputs),
-                        compute_backend=resolved_backend.name,
-                        compute_options_json="{}",
-                        output_roles_json=json.dumps(
-                            sorted(composite_class.outputs.keys())
-                        ),
-                        output_types_json=json.dumps(output_types_map),
+                start_record = StepStartRecord(
+                    step_run_id=composite_step_run_id,
+                    step_spec_id=step_spec_id,
+                    step_number=step_number,
+                    step_name=name,
+                    operation_class=f"{composite_class.__module__}.{composite_class.__qualname__}",
+                    params_json=json.dumps(full_params or {}),
+                    input_refs_json=_serialize_input_refs(inputs),
+                    compute_backend=resolved_backend.name,
+                    compute_options_json="{}",
+                    output_roles_json=json.dumps(
+                        sorted(composite_class.outputs.keys())
                     ),
-                    result,
+                    output_types_json=json.dumps(output_types_map),
                 )
-                logger.info(
-                    "Step %d (%s) completed in %.1fs [%d/%d succeeded]",
-                    step_number,
-                    name,
-                    elapsed,
-                    result.succeeded_count,
-                    result.total_count,
-                )
+                if result.metadata.get("terminal_failure") == "commit":
+                    error_msg = result.metadata.get("commit_error") or "Commit failed"
+                    self._step_tracker.record_step_failed(
+                        start_record,
+                        error_msg,
+                        result=result,
+                    )
+                    logger.error(
+                        "Step %d (%s) failed during commit after %.1fs: %s",
+                        step_number,
+                        name,
+                        elapsed,
+                        error_msg,
+                    )
+                else:
+                    self._step_tracker.record_step_completed(start_record, result)
+                    logger.info(
+                        "Step %d (%s) completed in %.1fs [%d/%d succeeded]",
+                        step_number,
+                        name,
+                        elapsed,
+                        result.succeeded_count,
+                        result.total_count,
+                    )
                 self._step_results.append(result)
                 self._named_steps.setdefault(result.step_name, []).append(result)
                 return result

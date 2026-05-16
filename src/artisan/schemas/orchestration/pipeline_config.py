@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from artisan.schemas.enums import CachePolicy, FailurePolicy
+from artisan.schemas.orchestration.commit_config import CommitConfig
 
 
 class PipelineConfig(BaseModel):
@@ -55,6 +56,10 @@ class PipelineConfig(BaseModel):
     skip_cache: bool = Field(
         default=False,
         description="Bypass all cache lookups (step-level and execution-level).",
+    )
+    commit_config: CommitConfig = Field(
+        default_factory=CommitConfig,
+        description="Configuration for staged Delta commit chunking.",
     )
 
     model_config = {"frozen": True}

@@ -37,6 +37,7 @@ from artisan.orchestration.pipeline_manager import (
     _validate_resources,
 )
 from artisan.schemas.artifact.types import ArtifactTypes
+from artisan.schemas.orchestration.commit_config import CommitConfig
 from artisan.schemas.orchestration.output_reference import OutputReference
 from artisan.schemas.orchestration.pipeline_config import PipelineConfig
 from artisan.schemas.orchestration.step_result import StepResult
@@ -81,6 +82,20 @@ def _make_pipeline(tmp_path) -> PipelineManager:
     return PipelineManager(config)
 
 
+def test_pipeline_config_accepts_commit_config(tmp_path):
+    """PipelineConfig carries staged commit chunk settings."""
+    config = PipelineConfig(
+        name="test",
+        delta_root=tmp_path / "delta",
+        staging_root=tmp_path / "staging",
+        working_root=tmp_path / "working",
+        commit_config=CommitConfig(initial_chunk_size=7, max_commit_chunk_rows=99),
+    )
+
+    assert config.commit_config.initial_chunk_size == 7
+    assert config.commit_config.max_commit_chunk_rows == 99
+
+
 class TestRunReturnsFailedStepResult:
     """Tests for F22: _run() returns StepResult instead of raising."""
 
@@ -122,6 +137,39 @@ class TestRunReturnsFailedStepResult:
         mock_tracker.record_step_failed.assert_called_once()
         call_args = mock_tracker.record_step_failed.call_args
         assert "ValueError" in call_args[0][1]
+
+    @patch("artisan.orchestration.pipeline_manager.execute_step")
+    @patch("artisan.orchestration.pipeline_manager.StepTracker")
+    def test_commit_terminal_step_records_failed_not_completed(
+        self, mock_tracker_cls, mock_execute, tmp_path
+    ):
+        """Commit-terminal results are recorded as failed steps with counts."""
+        mock_tracker = MagicMock()
+        mock_tracker.check_cache.return_value = None
+        mock_tracker_cls.return_value = mock_tracker
+
+        mock_execute.return_value = StepResult(
+            step_name="mock_op",
+            step_number=0,
+            success=False,
+            total_count=3,
+            succeeded_count=2,
+            failed_count=1,
+            output_roles=frozenset(["output"]),
+            output_types={"output": "data"},
+            metadata={
+                "commit_error": "OSError: Disk full",
+                "terminal_failure": "commit",
+            },
+        )
+
+        pipeline = _make_pipeline(tmp_path)
+        result = pipeline.run(_MockOp, inputs={"data": ["a" * 32]})
+
+        assert result.success is False
+        mock_tracker.record_step_failed.assert_called_once()
+        mock_tracker.record_step_completed.assert_not_called()
+        assert mock_tracker.record_step_failed.call_args.kwargs["result"] == result
 
 
 class TestResilientFinalize:

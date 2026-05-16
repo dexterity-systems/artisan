@@ -167,15 +167,33 @@ class StepTracker:
         self,
         start_record: StepStartRecord,
         error: str,
+        result: StepResult | None = None,
     ) -> None:
         """Write a 'failed' row after step failure.
 
         Args:
             start_record: The original StepStartRecord for metadata.
             error: Error message string.
+            result: Optional StepResult to persist counts and metadata.
         """
         row = self._base_row(start_record, "failed")
         row["error"] = error
+        if result is not None:
+            row.update(
+                output_roles_json=json.dumps(sorted(result.output_roles)),
+                output_types_json=json.dumps(result.output_types),
+                total_count=result.total_count,
+                succeeded_count=result.succeeded_count,
+                failed_count=result.failed_count,
+                duration_seconds=result.duration_seconds,
+                dispatch_error=(
+                    result.metadata.get("dispatch_error") if result.metadata else None
+                ),
+                commit_error=(
+                    result.metadata.get("commit_error") if result.metadata else None
+                ),
+                metadata=json.dumps(result.metadata) if result.metadata else None,
+            )
         df = pl.DataFrame([row], schema=STEPS_SCHEMA)
         self._write_row(df)
 
