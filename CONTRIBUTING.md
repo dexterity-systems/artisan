@@ -3,6 +3,9 @@
 Thank you for your interest in contributing to Artisan! This document explains
 how to get started, what we expect, and how we work together.
 
+Follow the [committed-content policy](AGENTS.md#committed-content) for source,
+documentation, examples, and generated artifacts.
+
 ---
 
 ## Before You Start
